@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
+use std::thread::sleep;
+use std::time::Duration;
 use std::usize;
 use burn::backend::NdArray;
 use burn::backend::ndarray::NdArrayDevice;
@@ -10,28 +12,12 @@ use burn::tensor::Tensor;
 use burn::optim::{SgdConfig, Optimizer, GradientsParams};
 use burn::nn::loss::{CrossEntropyLossConfig, MseLoss};
 use burn::prelude::ToElement;
+use rand::prelude::*;
 
 const FACTOR: f64 = 0.8;
 
-const PATTERNS: &'static[(f64, &'static[u8])] = &[
-    (0.99, &[1, 2, 3, 4, 5, 6, 7, 8, 9]),
-    (0.99, &[9,8,7,6,5,4,3,2]),
-    (0.6, &[1]),
-    (0.6, &[1, 2]),
-    (0.6, &[2]),
-    (0.6, &[2, 3]),
-    (0.6, &[3]),
-    (0.6, &[3, 4]),
-    (0.6, &[4]),
-    (0.6, &[4, 5]),
-    (0.6, &[5]),
-    (0.6, &[5, 6]),
-    (0.6, &[6]),
-    (0.6, &[6, 7]),
-    (0.6, &[7]),
-    (0.6, &[8]),
-    (0.6, &[9]),
-];
+const SEQUENCE: &'static[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9,8,7,6,5,4,3,2,1];
+const MAX_ITERATIONS: usize = 400_000;
 
 fn main() {
     const SZ: usize = 10;
@@ -42,19 +28,21 @@ fn main() {
     // We need a backend that supports Autodiff for the .learn() method
     type MyBackend = burn::backend::Autodiff<NdArray>;
     let mut net = ThreeLayerMlp::<MyBackend>::new(&dev);
-    let mut learn_rate_inc = LearnRateInc::new(LearningMethod::Flat, 0.99);
+    let mut learn_rate_inc = LearnRateInc::new(LearningMethod::Flat, 0.995);
     // let mut learn_rate_inc = LearnRateInc::new(LearningMethod::Flat, 0.999);
 
     // Initialize a simple SGD optimizer
     let mut optim = SgdConfig::new().init();
 
     let mut iteration = 0;
-    let mut pattern = 0;
     let mut average_score = 0.0;
     const ALPHA:f64 = 0.1; // Adjust this: 0.1 means a "memory" of roughly the last 10-20 guesses.
+    let mut rng = rand::rng();
+    let mut pattern = generate_sub_sequence(SEQUENCE, &mut rng);
+    let mut losing_streak = 0;
     loop {
         iteration = usize::wrapping_add(iteration, 1);
-        let my_number = read_guess(&mut iteration, pattern);
+        let my_number = read_guess(&mut iteration, pattern.as_slice());
 
         // Predict based on current state (before pushing the new number)
         let guess = net.predict(&answers, &dev);
@@ -63,19 +51,26 @@ fn main() {
         let mut points = 0.0;
         let emoji = match guess==my_number{
             true => {
+                losing_streak = 0;
                 points = 1.0;
                 "✅"
             },
-            false => "❌",
+            false => {
+                losing_streak+=1;
+                "❌"
+            },
         };
         average_score = (points * ALPHA) + (average_score * (1.0 - ALPHA));
         let display_percent = average_score * 100.0;
-        println!("[{iteration:010} {display_percent:.2}%] My prediction was: {guess}{emoji}. You entered: {my_number}; Learning rate={:.3}, Previous = {nums:?}", FACTOR * learn_rate_inc.poll_rate_inverse());
+        println!("[{iteration:010} {display_percent:05.2}%] My prediction was: {guess}{emoji}. You entered: {my_number}; Learning rate={:.3}, Previous = {nums:?}", FACTOR * learn_rate_inc.poll_rate_inverse());
 
-        let desired_score = PATTERNS[pattern].0;
-        if average_score >= desired_score {
+        const MAX_LOSING_STREAK : usize = 50;
+        let desired_score = 0.5;
+        if average_score >= desired_score || losing_streak >= MAX_LOSING_STREAK {
+            // sleep(Duration::from_secs(2));
+            losing_streak = 0;
             average_score = 0.0;
-            pattern = (pattern + 1) % PATTERNS.len();
+            pattern = generate_sub_sequence(SEQUENCE, &mut rng);
         }
 
         // Online learning: Train the network on the new data point
@@ -88,13 +83,39 @@ fn main() {
     }
 }
 
-fn read_guess(iteration: &mut usize, pattern: usize) -> u8 {
+fn generate_sub_sequence(pattern: &[u8], mut rng: &mut ThreadRng) -> Vec<u8> {
+    if pattern.is_empty() {
+        return vec![];
+    }
+
+    // 1. Choose a random start index
+    let start = rng.random_range(0..pattern.len());
+
+    // 2. Choose a random length (at least 1, up to the remaining items)
+    let max_len = pattern.len() - start;
+    let len = rng.random_range(1..=max_len);
+
+    // 3. Extract the part of the slice
+    let mut sub_vec = pattern[start..(start + len)].to_vec();
+
+    // 4. Randomly decide to reverse it (50/50 chance)
+    if rng.random_bool(0.5) {
+        sub_vec.reverse();
+    }
+
+    // Double reverse?
+    if rng.random_bool(0.5) {
+        sub_vec.extend(sub_vec.iter().cloned().rev().collect::<Vec<u8>>());
+    }
+
+    sub_vec
+}
+
+fn read_guess(iteration: &mut usize, pattern: &[u8]) -> u8 {
     const SIMULATE: bool = true;
-    const MAX_ITERATIONS: usize = 30_000;
     let simulate = SIMULATE && *iteration<MAX_ITERATIONS;
     match simulate {
         true => {
-            let (_, pattern) = PATTERNS[pattern];
             pattern[*iteration % pattern.len()]
         }
         false => {
@@ -117,7 +138,7 @@ pub struct ThreeLayerMlp<B: Backend> {
     activation: Relu,
 }
 
-const MIDDLE_SZ: usize = 32;
+const MIDDLE_SZ: usize = 50;
 
 impl<B: Backend> ThreeLayerMlp<B> {
     pub fn new(device: &B::Device) -> Self {
